@@ -1,0 +1,16 @@
+name: mujoco
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.12
+  - numpy
+  - scipy
+  - pip
+  - pip:
+      - torch
+      - gymnasium
+      - mujoco
+      - stable-baselines3
+      - cma
+      - tensorboard
