@@ -30,6 +30,7 @@ def train_new_model(new_model_path, test_model_path, output_policy_path, output_
                     n_envs=24, visualize: bool = False, resume_from: Optional[str] = None,
                     total_timesteps: int = 5_000_000,
                     seed: int = 0,
+                    design_parameters=None,
                     ):
     random.seed(seed)
     np.random.seed(seed)
@@ -42,7 +43,7 @@ def train_new_model(new_model_path, test_model_path, output_policy_path, output_
     # 创建子代的策略保存文件
     policy_path = os.path.join(output_policy_path, str(generation))
 
-    ENV_KWARGS = {'visualize': visualize}
+    ENV_KWARGS = {'visualize': visualize, 'design_parameters': design_parameters}
 
     # 加载环境
     env = make_vec_env(
@@ -53,15 +54,17 @@ def train_new_model(new_model_path, test_model_path, output_policy_path, output_
         vec_env_kwargs={"start_method": "fork"}
     )
     
+    model = None
     if resume_from is not None:
-            resume_path = resume_from if resume_from.endswith(".zip") else f"{resume_from}.zip"
-            if os.path.exists(resume_path):
-                model = PPO.load(resume_from, env=env)
-            else:
-                print(f"[train_ppo] resume model not found: {resume_path}, starting from scratch.")
-                resume_from = None
-    
-    if resume_from is None:
+        resume_path = resume_from if resume_from.endswith(".zip") else f"{resume_from}.zip"
+        if os.path.exists(resume_path):
+            print(f"[train_ppo] warm-starting from {resume_path}")
+            model = PPO.load(resume_from, env=env)
+        else:
+            print(f"[train_ppo] resume model not found: {resume_path}, starting from scratch.")
+            resume_from = None
+
+    if model is None:
         POLICY_KWARGS = dict(
                 activation_fn=nn.ReLU,
                 net_arch=dict(pi=[256, 128], vf=[256, 128])
@@ -79,13 +82,15 @@ def train_new_model(new_model_path, test_model_path, output_policy_path, output_
                     device="cuda" if torch.cuda.is_available() else "cpu",
                     tensorboard_log=output_tensorboard_path
                 )
-        print(f"并行环境数: {n_envs}")
-        call = callback(train_information_path)
-        model.learn(
-                total_timesteps=total_timesteps,
-                progress_bar=False,
-                callback=call,
-            )
+
+    print(f"并行环境数: {n_envs}")
+    call = callback(train_information_path)
+    model.learn(
+        total_timesteps=total_timesteps,
+        progress_bar=False,
+        callback=call,
+        reset_num_timesteps=True,
+    )
 
     os.makedirs(os.path.dirname(os.path.abspath(policy_path)), exist_ok=True)
     model.save(policy_path)
@@ -96,7 +101,7 @@ def train_new_model(new_model_path, test_model_path, output_policy_path, output_
     return policy_path
 
 
-def test_model(new_model_path, test_model_path, output_policy_path, output_record_path, generation, total_episodes=1, seed=0):
+def test_model(new_model_path, test_model_path, output_policy_path, output_record_path, generation, total_episodes=1, seed=0, design_parameters=None):
     np.random.seed(seed)
 
     env = ParallelEnv(
@@ -106,6 +111,7 @@ def test_model(new_model_path, test_model_path, output_policy_path, output_recor
         direction=DIRECTION,
         amplitude=AMPLITUDE,
         omega=OMEGA,
+        design_parameters=design_parameters,
     )
     model = PPO.load(output_policy_path, env=env)
 

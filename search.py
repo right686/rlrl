@@ -19,11 +19,12 @@ task_object = 'A'
 
 # 总开关
 SEED = 42
-TOTAL_TIMESTEPS = 50_000_000
-N_ENVS_PER_SAMPLE = 8
+TOTAL_TIMESTEPS = int(os.environ.get("TOTAL_TIMESTEPS", "50_000_000"))
+N_ENVS_PER_SAMPLE = int(os.environ.get("N_ENVS_PER_SAMPLE", "8"))
+WARM_START_TIMESTEPS = int(os.environ.get("WARM_START_TIMESTEPS", str(TOTAL_TIMESTEPS)))
 PARALLEL_SAMPLES = True
 MAX_SAMPLE_WORKERS = 1
-MAX_GENERATIONS = 2
+MAX_GENERATIONS = int(os.environ.get("MAX_GENERATIONS", "2"))
 
 
 def make_seed(generation, sample_index):
@@ -73,7 +74,7 @@ def design_from_solution(x):
 
 
 def evaluate_sample(args):
-    sample_index, solution, generation = args
+    sample_index, solution, generation, warm_start_path = args
     design = design_from_solution(solution)
     kuopu_parameter = denormalize_angle_variables(np.asarray(solution[5:9], dtype=np.float64))
 
@@ -88,6 +89,7 @@ def evaluate_sample(args):
     apply_leg_posture(test_model_path, posture)
     apply_leg_posture(new_model_path, posture)
     seed = make_seed(generation, sample_index)
+    timesteps = WARM_START_TIMESTEPS if warm_start_path is not None else TOTAL_TIMESTEPS
     control_model_path = train_new_model(
         new_model_path = new_model_path,
         test_model_path = test_model_path,
@@ -96,8 +98,10 @@ def evaluate_sample(args):
         output_record_path = output_record_path,
         generation = generation,
         n_envs=N_ENVS_PER_SAMPLE,
-        total_timesteps=TOTAL_TIMESTEPS,
+        total_timesteps=timesteps,
         seed=seed,
+        resume_from=warm_start_path,
+        design_parameters=design,
     )
 
     force, v = test_model(
@@ -107,12 +111,13 @@ def evaluate_sample(args):
         output_record_path=output_record_path,
         generation=generation,
         seed=seed,
+        design_parameters=design,
     )
     objective = float(compute_object_func(task_object, force, v))
     physical_solution = np.asarray(solution, dtype=np.float64).copy()
     physical_solution[5:9] = kuopu_parameter
     record_evolution_sample(generation, sample_index, physical_solution, design, objective)
-    return objective
+    return objective, control_model_path
 
 def save_new_path(generation, sample_index):
     root_path = os.path.abspath(os.path.dirname(__file__))
@@ -219,19 +224,26 @@ def main_opt():
         )
 
     generation = 0
+    warm_start_path = None
     while not es.stop():
         solutions = es.ask(number=pop_size)
         tasks = [
-            (sample_index, np.asarray(x, dtype=np.float64), generation)
+            (sample_index, np.asarray(x, dtype=np.float64), generation, warm_start_path)
             for sample_index, x in enumerate(solutions)
         ]
 
         if executor is not None:
-            fitnesses = list(executor.map(evaluate_sample, tasks))
+            results = list(executor.map(evaluate_sample, tasks))
         else:
-            fitnesses = [evaluate_sample(task) for task in tasks]
+            results = [evaluate_sample(task) for task in tasks]
+
+        fitnesses = [objective for objective, _ in results]
+        policy_paths = [path for _, path in results]
 
         es.tell(solutions, fitnesses)
+
+        best_index = int(np.argmin(fitnesses))
+        warm_start_path = policy_paths[best_index]
 
         generation += 1
         print(f"Gen {generation:4d} | best = {es.result.fbest:.6e}")

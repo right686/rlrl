@@ -17,11 +17,37 @@ def _unit(v: np.ndarray) -> np.ndarray:
 
 def _cross(v: np.ndarray, M: np.ndarray) -> np.ndarray:
     """Cross product of a 3-vector with each column of a (3, n) matrix."""
-    return _skew(v) @ M
+    v = np.asarray(v, dtype=np.float64).reshape(3)
+    M = np.asarray(M, dtype=np.float64)
+    if M.ndim == 1:
+        M = M.reshape(3)
+        return np.array(
+            [
+                v[1] * M[2] - v[2] * M[1],
+                v[2] * M[0] - v[0] * M[2],
+                v[0] * M[1] - v[1] * M[0],
+            ]
+        )
+    M = M.reshape(3, -1)
+    return np.vstack(
+        (
+            v[1] * M[2] - v[2] * M[1],
+            v[2] * M[0] - v[0] * M[2],
+            v[0] * M[1] - v[1] * M[0],
+        )
+    )
 
 def _cross_columns(A: np.ndarray, B: np.ndarray) -> np.ndarray:
     """Column-wise cross product for two (3, n) matrices."""
-    return np.cross(A, B, axis=0)
+    A = np.asarray(A, dtype=np.float64).reshape(3, -1)
+    B = np.asarray(B, dtype=np.float64).reshape(3, -1)
+    return np.vstack(
+        (
+            A[1] * B[2] - A[2] * B[1],
+            A[2] * B[0] - A[0] * B[2],
+            A[0] * B[1] - A[1] * B[0],
+        )
+    )
 
 class UCUDynamics:
     """Parameterized complete 6-UCU dynamics."""

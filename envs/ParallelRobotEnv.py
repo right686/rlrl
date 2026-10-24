@@ -70,6 +70,7 @@ class ParallelEnv(gym.Env):
         feedforward_scale: float = 1.0,
         energy_cost_weight: float = 1.0,
         residual_limit: float = 1,
+        design_parameters=None,
     ):
         super().__init__()
         # 可视化
@@ -104,10 +105,13 @@ class ParallelEnv(gym.Env):
             dtype=np.float32,
         )
 
-        # current pose/velocity, target pose/velocity/acceleration,
-        # leg lengths, dynamics feedforward force, time
-        # 当前位姿，速度；目标位姿，速度，加速度；腿长；动力学输出力；时间
-        obs_size = 3 + 3 + 3 + 3 + 3 + 3 + 3 + 3 + 3 + 3 + 6 + 6 + 1
+        # 当前位姿、速度，目标位姿、速度、加速度，腿长，前馈力，时间，设计参数
+        self.design_parameters = (
+            np.asarray(design_parameters, dtype=np.float32).reshape(-1)
+            if design_parameters is not None
+            else np.zeros(0, dtype=np.float32)
+        )
+        obs_size = 3 + 3 + 3 + 3 + 3 + 3 + 3 + 3 + 3 + 3 + 6 + 6 + 1 + self.design_parameters.size
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
@@ -129,6 +133,9 @@ class ParallelEnv(gym.Env):
 
         # 数据缓存区
         self.prev_action = np.zeros(self.model.nu, dtype=np.float32)
+        self._snapshot = None
+        self._snapshot_time = None
+        self._cached_observation = None
 
         self.neutral_height, self.neutral_qpos = self.compute_motion_platform_height(self.model)
         self.dynamics_neutral_height, self.dynamics_neutral_qpos = self.compute_motion_platform_height(self.dynamics_model)
@@ -195,7 +202,9 @@ class ParallelEnv(gym.Env):
         self.time = 0.0
         self.prev_action = np.zeros(self.model.nu, dtype=np.float32)
         self.initial_top_pos = self.data.sensor(_POS_SENSOR).data.copy()
-        return self.get_observation(), {}
+        self._snapshot, self._cached_observation = self._make_snapshot()
+        self._snapshot_time = self.time
+        return self._cached_observation, {}
 
     def step(self, action):
         # 动作缩放
@@ -206,9 +215,16 @@ class ParallelEnv(gym.Env):
         previous_action = self.prev_action.copy()
         self.prev_action = action.copy()
 
+        snapshot = self._get_snapshot()
+
         # 动力学前馈 + PD 反馈 + RL 残差
-        feedforward = self.compute_dynamic_force()
-        pd_torque = self.compute_pd_torque() if self.use_pd_feedback else np.zeros(self.model.nu, dtype=np.float32)
+        feedforward = snapshot["feedforward"]
+        pd_torque = self._compute_pd_torque_from(
+            snapshot["position"],
+            snapshot["rotation"],
+            snapshot["target_pose"],
+            snapshot["target_vel"],
+        ) if self.use_pd_feedback else np.zeros(self.model.nu, dtype=np.float32)
         control = feedforward + pd_torque + action
         control = np.clip(
             control,
@@ -224,27 +240,31 @@ class ParallelEnv(gym.Env):
         if self.viewer is not None:
             self.viewer.sync()
 
-        observation = self.get_observation()
-        reward, reward_info = self._compute_reward(action, feedforward, previous_action)
+        self._snapshot, self._cached_observation = self._make_snapshot()
+        self._snapshot_time = self.time
+        observation = self._cached_observation
+        reward, reward_info = self._compute_reward_from_snapshot(
+            action, feedforward, previous_action
+        )
         terminated = self.time >= self.max_episode_time
         truncated = False
         info = {**reward_info}
         return observation, float(reward), terminated, truncated, info
 
     def get_observation(self):
-        # 获取当前位姿信息
-        current_pos, current_euler, current_linvel, current_angvel = self._read_top_state()
-        # 计算目标轨迹
-        target_pose, target_vel, target_acc = self.target_tarject_fun(
-            self.direction,
-            self.amplitude,
-            self.omega,
-            self.time,
-        )
-        # 六杆长度
-        leg_lengths = self._read_leg_lengths()
-        # 前馈力
-        feedforward_force = self.compute_dynamic_force()
+        snapshot = self._get_snapshot()
+        return self._build_observation(snapshot)
+
+    def _build_observation(self, snapshot):
+        current_pos = snapshot["position"]
+        current_euler = snapshot["euler"]
+        current_linvel = snapshot["linvel"]
+        current_angvel = snapshot["angvel"]
+        target_pose = snapshot["target_pose"]
+        target_vel = snapshot["target_vel"]
+        target_acc = snapshot["target_acc"]
+        leg_lengths = snapshot["leg_lengths"]
+        feedforward_force = snapshot["feedforward"]
 
         observation = np.concatenate(
             [
@@ -261,58 +281,70 @@ class ParallelEnv(gym.Env):
                 leg_lengths,
                 feedforward_force,
                 np.array([self.time], dtype=np.float32),
+                self.design_parameters,
             ]
         )
         return observation.astype(np.float32)
 
-    def compute_dynamic_force(self):
-        if not self.use_dynamics_feedforward or self.dynamics is None:
-            return np.zeros(self.model.nu, dtype=np.float32)
+    def _get_snapshot(self):
+        if self._snapshot is None or self._snapshot_time != self.time:
+            self._snapshot, self._cached_observation = self._make_snapshot()
+            self._snapshot_time = self.time
+        return self._snapshot
 
-        current_pos = np.asarray(self.data.sensor(_POS_SENSOR).data)
-        current_quat = np.asarray(self.data.sensor(_QUAT_SENSOR).data)
-        current_rotation = R.from_quat(np.roll(current_quat, shift=-1)).as_matrix()
-        current_linvel = np.asarray(self.data.sensor(_LINVEL_SENSOR).data)
-        current_angvel = np.asarray(self.data.sensor(_ANGVEL_SENSOR).data)
-        current_velocity = np.concatenate([current_linvel, current_angvel])
-        _, _, target_acc = self.target_tarject_fun(
+    def _make_snapshot(self):
+        position, euler, rotation, linvel, angvel = self._read_top_state_full()
+        target_pose, target_vel, target_acc = self.target_tarject_fun(
             self.direction,
             self.amplitude,
             self.omega,
             self.time,
         )
+        feedforward = self._compute_dynamic_force_from(
+            position, rotation, linvel, angvel, target_acc
+        )
+        leg_lengths = self._read_leg_lengths()
+        snapshot = {
+            "position": position,
+            "euler": euler,
+            "rotation": rotation,
+            "linvel": linvel,
+            "angvel": angvel,
+            "target_pose": target_pose,
+            "target_vel": target_vel,
+            "target_acc": target_acc,
+            "feedforward": feedforward,
+            "leg_lengths": leg_lengths,
+        }
+        return snapshot, self._build_observation(snapshot)
+
+    def _compute_dynamic_force_from(
+        self, position, rotation, linvel, angvel, target_acc
+    ):
+        if not self.use_dynamics_feedforward or self.dynamics is None:
+            return np.zeros(self.model.nu, dtype=np.float32)
+
         force = self.dynamics.inverse_dynamics(
-            current_pos,
-            current_rotation,
-            current_velocity[:3],
-            current_velocity[3:],
+            position,
+            rotation,
+            linvel,
+            angvel,
             target_acc[:3],
             target_acc[3:],
         )
         return self.feedforward_scale * np.asarray(force, dtype=np.float32).reshape(self.model.nu)
 
-    def compute_pd_torque(self, ):
+    def _compute_pd_torque_from(self, position, rotation, target_pose, target_vel):
         if self.dynamics is None:
             return np.zeros(self.model.nu, dtype=np.float32)
 
-        target_pose, target_vel, _ = self.target_tarject_fun(
-            self.direction,
-            self.amplitude,
-            self.omega,
-            self.time,
-        )
-        target_pose = target_pose
-        target_vel = target_vel
         target_rotation = R.from_euler("xyz", target_pose[3:], degrees=False).as_matrix()
         desired_points = target_pose[:3, None] + target_rotation @ self.dynamics.p_local
         desired_lengths = np.linalg.norm(desired_points - self.dynamics.b, axis=0)
         neutral_slide_qpos = np.asarray(self.neutral_qpos[self.slide_qpos_adr], dtype=np.float64)
         desired_qpos = neutral_slide_qpos + desired_lengths - self.neutral_lengths
 
-        current_position = self.data.sensor(_POS_SENSOR).data.copy()
-        current_quat = self.data.sensor(_QUAT_SENSOR).data.copy()
-        current_rotation = R.from_quat(np.roll(current_quat, shift=-1)).as_matrix()
-        jacobian = self._force_jacobian(self.dynamics, current_position, current_rotation)
+        jacobian = self._force_jacobian(self.dynamics, position, rotation)
         desired_qvel = jacobian @ target_vel
 
         current_qpos = np.asarray(self.data.qpos[self.slide_qpos_adr])
@@ -320,6 +352,18 @@ class ParallelEnv(gym.Env):
         position_error = desired_qpos - current_qpos
         velocity_error = desired_qvel - current_qvel
         return self.pd_kp * position_error + self.pd_kd * velocity_error
+
+    def compute_dynamic_force(self):
+        return self._get_snapshot()["feedforward"].copy()
+
+    def compute_pd_torque(self):
+        snapshot = self._get_snapshot()
+        return self._compute_pd_torque_from(
+            snapshot["position"],
+            snapshot["rotation"],
+            snapshot["target_pose"],
+            snapshot["target_vel"],
+        )
 
     def compute_length(self, up: np.ndarray, down: np.ndarray) -> np.ndarray:
         up = np.asarray(up, dtype=np.float64)
@@ -399,12 +443,17 @@ class ParallelEnv(gym.Env):
             self.viewer = None
 
     def _read_top_state(self):
-        position = self.data.sensor(_POS_SENSOR).data.copy()
-        quat = self.data.sensor(_QUAT_SENSOR).data.copy()
-        euler = self._quat2euler(quat)
-        linvel = self.data.sensor(_LINVEL_SENSOR).data.copy()
-        angvel = self.data.sensor(_ANGVEL_SENSOR).data.copy()
+        position, euler, _, linvel, angvel = self._read_top_state_full()
         return position, euler, linvel, angvel
+
+    def _read_top_state_full(self):
+        position = np.asarray(self.data.sensor(_POS_SENSOR).data, dtype=np.float64)
+        quat = np.asarray(self.data.sensor(_QUAT_SENSOR).data, dtype=np.float64)
+        euler = self._quat2euler(quat)
+        rotation = self._quat_to_rotation_matrix(quat)
+        linvel = np.asarray(self.data.sensor(_LINVEL_SENSOR).data, dtype=np.float64)
+        angvel = np.asarray(self.data.sensor(_ANGVEL_SENSOR).data, dtype=np.float64)
+        return position, euler, rotation, linvel, angvel
 
     def _read_leg_lengths(self):
         upper = np.column_stack(
@@ -420,19 +469,35 @@ class ParallelEnv(gym.Env):
         scipy_quat = np.roll(quat, shift=-1)
         return R.from_quat(scipy_quat).as_euler("xyz", degrees=False)
 
+    def _quat_to_rotation_matrix(self, quat: np.ndarray) -> np.ndarray:
+        quat = np.asarray(quat, dtype=np.float64).reshape(4)
+        scipy_quat = np.roll(quat, shift=-1)
+        return R.from_quat(scipy_quat).as_matrix()
+
     def _read_actual_acceleration(self) -> np.ndarray:
         linear_acceleration = self.data.sensor(_LIN_ACC_SENSOR).data.copy()
         angular_acceleration = self.data.sensor(_ANG_ACC_SENSOR).data.copy()
         return np.concatenate([linear_acceleration, angular_acceleration])
 
     def _compute_reward(self, action: np.ndarray, feedforward: np.ndarray, previous_action: np.ndarray):
-        current_pos, current_euler, current_linvel, current_angvel = self._read_top_state()
-        target_pose, target_vel, target_acc = self.target_tarject_fun(
-            self.direction,
-            self.amplitude,
-            self.omega,
-            self.time,
-        )
+        snapshot = self._get_snapshot()
+        return self._compute_reward_from_snapshot(action, feedforward, previous_action, snapshot=snapshot)
+
+    def _compute_reward_from_snapshot(
+        self,
+        action: np.ndarray,
+        feedforward: np.ndarray,
+        previous_action: np.ndarray,
+        snapshot=None,
+    ):
+        snapshot = snapshot or self._get_snapshot()
+        current_pos = snapshot["position"]
+        current_euler = snapshot["euler"]
+        current_linvel = snapshot["linvel"]
+        current_angvel = snapshot["angvel"]
+        target_pose = snapshot["target_pose"]
+        target_vel = snapshot["target_vel"]
+        target_acc = snapshot["target_acc"]
 
         position_error = float(np.linalg.norm(target_pose[:3] - current_pos))
         posture_error = self._orientation_error(target_pose[3:], current_euler)
