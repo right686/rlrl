@@ -12,7 +12,7 @@ from utils.generate_new_models import (
     generate_model,
     generate_test_model,
 )
-from train_inner import train_new_model, test_model
+from train_inner import train_new_model, test_model, train_universal_policy
 
 
 task_object = 'A'
@@ -21,10 +21,11 @@ task_object = 'A'
 SEED = 42
 TOTAL_TIMESTEPS = int(os.environ.get("TOTAL_TIMESTEPS", "50_000_000"))
 N_ENVS_PER_SAMPLE = int(os.environ.get("N_ENVS_PER_SAMPLE", "8"))
-WARM_START_TIMESTEPS = int(os.environ.get("WARM_START_TIMESTEPS", str(TOTAL_TIMESTEPS)))
 PARALLEL_SAMPLES = True
 MAX_SAMPLE_WORKERS = 1
 MAX_GENERATIONS = int(os.environ.get("MAX_GENERATIONS", "2"))
+PRETRAIN_DESIGNS = int(os.environ.get("PRETRAIN_DESIGNS", "8"))
+PRETRAIN_TIMESTEPS = int(os.environ.get("PRETRAIN_TIMESTEPS", "20_000_000"))
 
 
 def make_seed(generation, sample_index):
@@ -73,8 +74,77 @@ def design_from_solution(x):
     ]
 
 
+def sample_pretrain_solutions(count, seed):
+    pole_r_range, pole_length_range, motion_platform_range, _, _, _, _ = body_parameter_range()
+    lows = np.array(
+        [
+            pole_r_range[0],
+            pole_r_range[0],
+            pole_length_range[0],
+            pole_length_range[0],
+            motion_platform_range[0],
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+        ]
+    )
+    highs = np.array(
+        [
+            pole_r_range[1],
+            pole_r_range[1],
+            pole_length_range[1],
+            pole_length_range[1],
+            motion_platform_range[1],
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+        ]
+    )
+    rng = np.random.default_rng(seed)
+    return rng.uniform(lows, highs, size=(count, len(lows)))
+
+
+def prepare_universal_policy(pretrain_dir, total_timesteps, seed):
+    solutions = sample_pretrain_solutions(PRETRAIN_DESIGNS, seed)
+    model_paths = []
+    test_model_paths = []
+    design_parameters = []
+
+    for index, solution in enumerate(solutions):
+        design = design_from_solution(solution)
+        model_dir = os.path.join(pretrain_dir, "model", str(index))
+        os.makedirs(model_dir, exist_ok=True)
+
+        model_path = generate_model(design, model_dir, index)
+        test_model_path = generate_test_model(design, model_dir, index)
+        angles = denormalize_angle_variables(solution[5:9])
+        posture = compute_leg_posture(test_model_path, angles)
+        apply_leg_posture(test_model_path, posture)
+        apply_leg_posture(model_path, posture)
+
+        model_paths.append(model_path)
+        test_model_paths.append(test_model_path)
+        design_parameters.append(np.asarray(design, dtype=np.float32))
+
+    policy_path = os.path.join(pretrain_dir, "universal_policy")
+    tensorboard_path = os.path.join(pretrain_dir, "tensorboard")
+    os.makedirs(tensorboard_path, exist_ok=True)
+
+    return train_universal_policy(
+        model_paths=model_paths,
+        test_model_paths=test_model_paths,
+        design_parameters=design_parameters,
+        output_policy_path=policy_path,
+        output_tensorboard_path=tensorboard_path,
+        total_timesteps=total_timesteps,
+        seed=seed,
+    )
+
+
 def evaluate_sample(args):
-    sample_index, solution, generation, warm_start_path = args
+    sample_index, solution, generation, universal_policy_path = args
     design = design_from_solution(solution)
     kuopu_parameter = denormalize_angle_variables(np.asarray(solution[5:9], dtype=np.float64))
 
@@ -89,7 +159,6 @@ def evaluate_sample(args):
     apply_leg_posture(test_model_path, posture)
     apply_leg_posture(new_model_path, posture)
     seed = make_seed(generation, sample_index)
-    timesteps = WARM_START_TIMESTEPS if warm_start_path is not None else TOTAL_TIMESTEPS
     control_model_path = train_new_model(
         new_model_path = new_model_path,
         test_model_path = test_model_path,
@@ -98,9 +167,9 @@ def evaluate_sample(args):
         output_record_path = output_record_path,
         generation = generation,
         n_envs=N_ENVS_PER_SAMPLE,
-        total_timesteps=timesteps,
+        total_timesteps=TOTAL_TIMESTEPS,
         seed=seed,
-        resume_from=warm_start_path,
+        resume_from=universal_policy_path,
         design_parameters=design,
     )
 
@@ -117,7 +186,7 @@ def evaluate_sample(args):
     physical_solution = np.asarray(solution, dtype=np.float64).copy()
     physical_solution[5:9] = kuopu_parameter
     record_evolution_sample(generation, sample_index, physical_solution, design, objective)
-    return objective, control_model_path
+    return objective
 
 def save_new_path(generation, sample_index):
     root_path = os.path.abspath(os.path.dirname(__file__))
@@ -223,27 +292,37 @@ def main_opt():
             mp_context=mp.get_context("spawn"),
         )
 
+    universal_policy_path = None
+    if PRETRAIN_DESIGNS > 0:
+        root_path = os.path.abspath(os.path.dirname(__file__))
+        pretrain_dir = os.path.join(root_path, "output", "zsin_0", "pretrain")
+        os.makedirs(pretrain_dir, exist_ok=True)
+        print(f"[pretrain] sampling {PRETRAIN_DESIGNS} designs, {PRETRAIN_TIMESTEPS} timesteps")
+        universal_policy_path = prepare_universal_policy(
+            pretrain_dir,
+            PRETRAIN_TIMESTEPS,
+            SEED,
+        )
+
     generation = 0
-    warm_start_path = None
     while not es.stop():
         solutions = es.ask(number=pop_size)
         tasks = [
-            (sample_index, np.asarray(x, dtype=np.float64), generation, warm_start_path)
+            (
+                sample_index,
+                np.asarray(x, dtype=np.float64),
+                generation,
+                universal_policy_path,
+            )
             for sample_index, x in enumerate(solutions)
         ]
 
         if executor is not None:
-            results = list(executor.map(evaluate_sample, tasks))
+            fitnesses = list(executor.map(evaluate_sample, tasks))
         else:
-            results = [evaluate_sample(task) for task in tasks]
-
-        fitnesses = [objective for objective, _ in results]
-        policy_paths = [path for _, path in results]
+            fitnesses = [evaluate_sample(task) for task in tasks]
 
         es.tell(solutions, fitnesses)
-
-        best_index = int(np.argmin(fitnesses))
-        warm_start_path = policy_paths[best_index]
 
         generation += 1
         print(f"Gen {generation:4d} | best = {es.result.fbest:.6e}")

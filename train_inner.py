@@ -101,6 +101,62 @@ def train_new_model(new_model_path, test_model_path, output_policy_path, output_
     return policy_path
 
 
+def train_universal_policy(
+    model_paths,
+    test_model_paths,
+    design_parameters,
+    output_policy_path,
+    output_tensorboard_path,
+    total_timesteps: int = 20_000_000,
+    seed: int = 0,
+):
+    if not (len(model_paths) == len(test_model_paths) == len(design_parameters)):
+        raise ValueError("model_paths, test_model_paths and design_parameters must have the same length")
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    env_fns = [
+        lambda i=i: ParallelEnv(
+            visualize=False,
+            model_path=model_paths[i],
+            test_model_path=test_model_paths[i],
+            design_parameters=design_parameters[i],
+        )
+        for i in range(len(model_paths))
+    ]
+    env = SubprocVecEnv(env_fns, start_method="fork")
+
+    policy_kwargs = dict(
+        activation_fn=nn.ReLU,
+        net_arch=dict(pi=[256, 128], vf=[256, 128]),
+    )
+    model = PPO(
+        policy="MlpPolicy",
+        env=env,
+        policy_kwargs=policy_kwargs,
+        verbose=1,
+        n_steps=2048,
+        batch_size=2048,
+        n_epochs=10,
+        gamma=0.99,
+        learning_rate=5e-4,
+        device="cuda" if torch.cuda.is_available() else "cpu",
+        tensorboard_log=output_tensorboard_path,
+    )
+    model.learn(total_timesteps=total_timesteps, progress_bar=False)
+
+    os.makedirs(os.path.dirname(os.path.abspath(output_policy_path)), exist_ok=True)
+    model.save(output_policy_path)
+    env.close()
+
+    print(f"通用策略已保存至: {output_policy_path}")
+    return output_policy_path
+
+
 def test_model(new_model_path, test_model_path, output_policy_path, output_record_path, generation, total_episodes=1, seed=0, design_parameters=None):
     np.random.seed(seed)
 
