@@ -90,12 +90,17 @@ def main():
         type=int,
         default=int(os.environ.get("PRETRAIN_TIMESTEPS", "20_000_000")),
     )
+    parser.add_argument("--workers", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-dir", default=default_output_dir)
     args = parser.parse_args()
 
     if args.designs <= 0:
         raise ValueError("--designs must be greater than zero")
+    if args.workers is None:
+        args.workers = min(os.cpu_count() or 16, args.designs)
+    if args.workers <= 0:
+        raise ValueError("--workers must be greater than zero")
 
     solutions = sample_pretrain_solutions(args.designs, args.seed)
     model_paths, test_model_paths, design_parameters = prepare_pretrain_models(
@@ -108,7 +113,7 @@ def main():
 
     print(
         f"[pretrain] designs={args.designs}, "
-        f"timesteps={args.timesteps}, output={policy_path}"
+        f"workers={args.workers}, timesteps={args.timesteps}, output={policy_path}"
     )
     train_universal_policy(
         model_paths=model_paths,
@@ -118,6 +123,7 @@ def main():
         output_tensorboard_path=tensorboard_path,
         total_timesteps=args.timesteps,
         seed=args.seed,
+        n_envs=args.workers,
     )
 
 

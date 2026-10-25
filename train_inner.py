@@ -9,6 +9,7 @@ from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.vec_env import SubprocVecEnv
 from utils.record_data import create_train_reward_path
 from envs.ParallelRobotEnv import ParallelEnv
+from envs.MultiMorphologyEnv import MultiMorphologyEnv
 from stable_baselines3 import PPO
 from typing import Optional
 from torch import nn
@@ -109,6 +110,7 @@ def train_universal_policy(
     output_tensorboard_path,
     total_timesteps: int = 20_000_000,
     seed: int = 0,
+    n_envs: int = 16,
 ):
     if not (len(model_paths) == len(test_model_paths) == len(design_parameters)):
         raise ValueError("model_paths, test_model_paths and design_parameters must have the same length")
@@ -119,16 +121,30 @@ def train_universal_policy(
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-    env_fns = [
-        lambda i=i: ParallelEnv(
-            visualize=False,
-            model_path=model_paths[i],
-            test_model_path=test_model_paths[i],
-            design_parameters=design_parameters[i],
-        )
-        for i in range(len(model_paths))
-    ]
+    worker_count = min(n_envs, len(model_paths))
+    if worker_count == len(model_paths):
+        env_fns = [
+            lambda i=i: ParallelEnv(
+                visualize=False,
+                model_path=model_paths[i],
+                test_model_path=test_model_paths[i],
+                design_parameters=design_parameters[i],
+            )
+            for i in range(len(model_paths))
+        ]
+    else:
+        design_chunks = np.array_split(np.arange(len(model_paths)), worker_count)
+        env_fns = [
+            lambda indices=indices: MultiMorphologyEnv(
+                model_paths=[model_paths[i] for i in indices],
+                test_model_paths=[test_model_paths[i] for i in indices],
+                design_parameters=[design_parameters[i] for i in indices],
+                visualize=False,
+            )
+            for indices in design_chunks
+        ]
     env = SubprocVecEnv(env_fns, start_method="fork")
+    print(f"通用策略并行环境数: {env.num_envs}, 覆盖构型数: {len(model_paths)}")
 
     policy_kwargs = dict(
         activation_fn=nn.ReLU,
