@@ -12,7 +12,12 @@ from utils.generate_new_models import (
     generate_model,
     generate_test_model,
 )
-from train_inner import train_new_model, test_model, train_universal_policy
+from utils.design_utils import (
+    body_parameter_range,
+    denormalize_angle_variables,
+    design_from_solution,
+)
+from train_inner import train_new_model, test_model
 
 
 task_object = 'A'
@@ -24,8 +29,6 @@ N_ENVS_PER_SAMPLE = int(os.environ.get("N_ENVS_PER_SAMPLE", "8"))
 PARALLEL_SAMPLES = True
 MAX_SAMPLE_WORKERS = 1
 MAX_GENERATIONS = int(os.environ.get("MAX_GENERATIONS", "2"))
-PRETRAIN_DESIGNS = int(os.environ.get("PRETRAIN_DESIGNS", "8"))
-PRETRAIN_TIMESTEPS = int(os.environ.get("PRETRAIN_TIMESTEPS", "20_000_000"))
 
 
 def make_seed(generation, sample_index):
@@ -60,88 +63,6 @@ def record_evolution_sample(generation, sample_index, solution, design, objectiv
         if write_header:
             writer.writerow(header)
         writer.writerow(row)
-
-def design_from_solution(x):
-    x = np.asarray(x, dtype=np.float64)
-    return [
-        x[0], x[1], x[2], x[3], x[4],
-        x[3], x[3], x[2],
-        x[1] ** 2 * x[3],
-        x[0] ** 2 * x[2],
-        x[0] ** 2 * x[2],
-        x[4], x[4], x[4], x[4], x[4], x[4],
-        x[4], x[4], x[4], x[4], x[4], x[4],
-    ]
-
-
-def sample_pretrain_solutions(count, seed):
-    pole_r_range, pole_length_range, motion_platform_range, _, _, _, _ = body_parameter_range()
-    lows = np.array(
-        [
-            pole_r_range[0],
-            pole_r_range[0],
-            pole_length_range[0],
-            pole_length_range[0],
-            motion_platform_range[0],
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-        ]
-    )
-    highs = np.array(
-        [
-            pole_r_range[1],
-            pole_r_range[1],
-            pole_length_range[1],
-            pole_length_range[1],
-            motion_platform_range[1],
-            1.0,
-            1.0,
-            1.0,
-            1.0,
-        ]
-    )
-    rng = np.random.default_rng(seed)
-    return rng.uniform(lows, highs, size=(count, len(lows)))
-
-
-def prepare_universal_policy(pretrain_dir, total_timesteps, seed):
-    solutions = sample_pretrain_solutions(PRETRAIN_DESIGNS, seed)
-    model_paths = []
-    test_model_paths = []
-    design_parameters = []
-
-    for index, solution in enumerate(solutions):
-        design = design_from_solution(solution)
-        model_dir = os.path.join(pretrain_dir, "model", str(index))
-        os.makedirs(model_dir, exist_ok=True)
-
-        model_path = generate_model(design, model_dir, index)
-        test_model_path = generate_test_model(design, model_dir, index)
-        angles = denormalize_angle_variables(solution[5:9])
-        posture = compute_leg_posture(test_model_path, angles)
-        apply_leg_posture(test_model_path, posture)
-        apply_leg_posture(model_path, posture)
-
-        model_paths.append(model_path)
-        test_model_paths.append(test_model_path)
-        design_parameters.append(np.asarray(design, dtype=np.float32))
-
-    policy_path = os.path.join(pretrain_dir, "universal_policy")
-    tensorboard_path = os.path.join(pretrain_dir, "tensorboard")
-    os.makedirs(tensorboard_path, exist_ok=True)
-
-    return train_universal_policy(
-        model_paths=model_paths,
-        test_model_paths=test_model_paths,
-        design_parameters=design_parameters,
-        output_policy_path=policy_path,
-        output_tensorboard_path=tensorboard_path,
-        total_timesteps=total_timesteps,
-        seed=seed,
-    )
-
 
 def evaluate_sample(args):
     sample_index, solution, generation, universal_policy_path = args
@@ -235,31 +156,6 @@ def initial_alg_parameter():
     sigma0 = 0.5
     return pop_size, sigma_fac, sigma0
 
-def body_parameter_range():
-    pole_r_range = [0.8, 1.2]
-    pole_length_range = [0.8, 1.2]
-    motion_platform_range = [0.8, 1.2]
-    polar_range1 = [135, 165]
-    azimuth_range1 = [29.3, 70]
-    polar_range2 = [135, 165]
-    azimuth_range2 = [-40, -29.3]
-    return pole_r_range, pole_length_range, motion_platform_range, polar_range1, azimuth_range1, polar_range2, azimuth_range2
-
-
-def denormalize_angle_variables(normalized_angles):
-    _, _, _, polar_range1, azimuth_range1, polar_range2, azimuth_range2 = body_parameter_range()
-    normalized_angles = np.asarray(normalized_angles, dtype=np.float64).reshape(4)
-    ranges = np.array(
-        [
-            [polar_range1[0], polar_range1[1]],
-            [azimuth_range1[0], azimuth_range1[1]],
-            [polar_range2[0], polar_range2[1]],
-            [azimuth_range2[0], azimuth_range2[1]],
-        ],
-        dtype=np.float64,
-    )
-    return ranges[:, 0] + normalized_angles * (ranges[:, 1] - ranges[:, 0])
-
 def main_opt():
     '''
     优化入口
@@ -292,17 +188,26 @@ def main_opt():
             mp_context=mp.get_context("spawn"),
         )
 
+    root_path = os.path.abspath(os.path.dirname(__file__))
+    default_policy_path = os.path.join(
+        root_path, "output", "zsin_0", "pretrain", "universal_policy"
+    )
+    configured_policy = os.environ.get("UNIVERSAL_POLICY_PATH")
     universal_policy_path = None
-    if PRETRAIN_DESIGNS > 0:
-        root_path = os.path.abspath(os.path.dirname(__file__))
-        pretrain_dir = os.path.join(root_path, "output", "zsin_0", "pretrain")
-        os.makedirs(pretrain_dir, exist_ok=True)
-        print(f"[pretrain] sampling {PRETRAIN_DESIGNS} designs, {PRETRAIN_TIMESTEPS} timesteps")
-        universal_policy_path = prepare_universal_policy(
-            pretrain_dir,
-            PRETRAIN_TIMESTEPS,
-            SEED,
+    if configured_policy:
+        policy_zip = (
+            configured_policy
+            if configured_policy.endswith(".zip")
+            else f"{configured_policy}.zip"
         )
+        if os.path.exists(policy_zip):
+            universal_policy_path = configured_policy
+        else:
+            print(f"[search] universal policy not found: {policy_zip}")
+    elif os.path.exists(f"{default_policy_path}.zip"):
+        universal_policy_path = default_policy_path
+    else:
+        print("[search] universal policy not found; samples will train from scratch")
 
     generation = 0
     while not es.stop():
